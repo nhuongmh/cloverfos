@@ -56,8 +56,14 @@ type HProcess struct {
 }
 
 type TScheduler interface {
-	GetFreetime(from time.Time, to time.Time) *[]TimeSlot
+	GetFreetime(from, to time.Time) *[]TimeSlot
+	GetTasksOfCustomTime(from, to time.Time) *[]TimeSlot
 	GetWhatNow() *TimeSlot
+	GetTodayTasks() *[]TimeSlot
+	GetThisWeekTasks() *[]TimeSlot
 	SetActually()
 	ScheduleTask(hp *HProcess) (*[]TimeSlot, error)
+}
+
+type Day interface {
 }
