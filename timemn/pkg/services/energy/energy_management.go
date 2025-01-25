@@ -50,12 +50,16 @@ func (es *energyMngService) EvaluateAllFromSheet(ctx context.Context, forceOverw
 	if err != nil {
 		return errors.Wrap(err, "Failed to fetch data from sheet")
 	}
-	logger.Log.Info().Msgf("Fetched %v rows from sheet", len(*dailyInputList))
+	logger.Log.Info().Msgf("Fetched %v rows from sheet: %v", len(*dailyInputList), *dailyInputList)
 
 	for i := range *dailyInputList {
-		dailyInput := (*dailyInputList)[i]
+		dailyInput := &(*dailyInputList)[i]
+		if dailyInput.Etd != 0 {
+			logger.Log.Info().Msgf("Skipping row %v, date=%v, etd=%v", dailyInput.Row, dailyInput.Date, dailyInput.Etd)
+			continue
+		}
 		logger.Log.Info().Msgf("Evaluating row %v, date=%v", dailyInput.Row, dailyInput.Date)
-		sleepScore, etf, err := es.evaluateEtf(&dailyInput)
+		sleepScore, etf, err := es.evaluateEtf(dailyInput)
 
 		if err != nil {
 			logger.Log.Warn().Err(err).Msgf("Failed to evaluate etf for row %v, date=%v", dailyInput.Row, dailyInput.Date)
@@ -67,32 +71,20 @@ func (es *energyMngService) EvaluateAllFromSheet(ctx context.Context, forceOverw
 			etf = 0
 		}
 
-		if err := es.handleEtfMismatch(&dailyInput, etf, forceOverwrite); err != nil {
+		if err := es.handleEtfMismatch(dailyInput, etf, forceOverwrite); err != nil {
 			return err
 		}
 
-		if err := es.writeValueToCell(dailyInput.Row, ENERGY_ETF_COL, fmt.Sprintf("%.2f", etf)); err != nil {
-			logger.Log.Warn().Err(err).Msgf("Failed to write etf to row %v", dailyInput.Row)
-			continue
-		}
-
-		if err := es.handleSleepScoreMismatch(&dailyInput, sleepScore, forceOverwrite); err != nil {
+		if err := es.handleSleepScoreMismatch(dailyInput, sleepScore, forceOverwrite); err != nil {
 			return err
-		}
-
-		if err := es.writeValueToCell(dailyInput.Row, ENERGY_SLEEP_SCORE_COL, fmt.Sprintf("%.2f", sleepScore)); err != nil {
-			logger.Log.Warn().Err(err).Msgf("Failed to write sleep score to row %v", dailyInput.Row)
-			continue
 		}
 
 		etd := es.calculateEtd(i, dailyInputList, etf)
-		if err := es.writeValueToCell(dailyInput.Row, ENERGY_ETD_COL, fmt.Sprintf("%.2f", etd)); err != nil {
-			logger.Log.Warn().Err(err).Msgf("Failed to write etd to row %v", dailyInput.Row)
-			continue
-		}
+		// (*dailyInputList)[i].Etd = etd
 		dailyInput.Etd = etd
-		if err := es.writeValueToCell(dailyInput.Row, ENERGY_ETD_PERC_COL, fmt.Sprintf("%.0f%%", etd*100)); err != nil {
-			logger.Log.Warn().Err(err).Msgf("Failed to write etd percent to row %v", dailyInput.Row)
+
+		if err := es.writeEnergyValues(dailyInput.Row, sleepScore, etf, etd); err != nil {
+			logger.Log.Warn().Err(err).Msgf("Failed to write energy values for row %v, date=%v", dailyInput.Row, dailyInput.Date)
 			continue
 		}
 	}
@@ -125,9 +117,12 @@ func (es *energyMngService) handleSleepScoreMismatch(dailyInput *model.DailyPhys
 }
 
 func (es *energyMngService) calculateEtd(index int, dailyInputList *[]model.DailyPhysicalInput, etf float64) float64 {
+	logger.Log.Info().Msgf("Calculating Etd for index %v, etf=%v, len=%v", index, etf, len(*dailyInputList))
 	if index > 0 {
+		logger.Log.Info().Msgf("Calculating Etd for index %v, etf=%v, yesterdayEtd=%v", index, etf, (*dailyInputList)[index-1].Etd)
 		return es.evaluateEtd((*dailyInputList)[index-1].Etd, etf)
 	}
+	logger.Log.Info().Msgf("Calculating Etd for index 0, etf=%v, yesterdayEtd=0", etf)
 	return etf
 }
 
@@ -193,7 +188,7 @@ func (es *energyMngService) evaluateEtf(input *model.DailyPhysicalInput) (sleepS
 		model.HS_WEIGHT*nsScore +
 		model.FEELING_WEIGHT*input.Feeling
 
-	logger.Log.Info().Msgf("SleepScore=%v, ExerciseScore=%v, NfScore=%v, NsScore=%v, Feeling=%v", sleepScore, exerciseScore, nfScore, nsScore, input.Feeling)
+	logger.Log.Info().Msgf("SleepScore=%v, ExerciseScore=%v, NfScore=%v, NsScore=%v, Feeling=%v => etf=%v", sleepScore, exerciseScore, nfScore, nsScore, input.Feeling, etf)
 	return sleepScore, etf, nil
 }
 
@@ -201,6 +196,7 @@ func (es *energyMngService) evaluateEtd(yesterdayEtd float64, todayEtf float64) 
 	if yesterdayEtd == 0 {
 		return todayEtf
 	}
+	logger.Log.Info().Msgf("Evaluating Etd: yesterdayEtd=%v, todayEtf=%v", yesterdayEtd, todayEtf)
 	return (2*todayEtf + yesterdayEtd) / 3
 }
 
@@ -209,6 +205,19 @@ func (es *energyMngService) writeValueToCell(row, col int, value string) error {
 	valueInputOption := "RAW"
 	valueRangeBody := &sheets.ValueRange{
 		Values: [][]interface{}{{value}},
+	}
+	_, err := es.GgSheetSrv.Spreadsheets.Values.Update(es.env.GoogleSpreadSheetId, valueRange, valueRangeBody).ValueInputOption(valueInputOption).Do()
+	if err != nil {
+		return errors.Wrapf(err, "Failed to write value to cell %v", valueRange)
+	}
+	return nil
+}
+
+func (es *energyMngService) writeEnergyValues(row int, sleepScore, etf, etd float64) error {
+	valueRange := fmt.Sprintf("%s!%s%d:%s%d", es.env.GoogleEnergySheetName, string(rune('A'+ENERGY_SLEEP_SCORE_COL)), row, string(rune('A'+ENERGY_ETD_PERC_COL)), row)
+	valueInputOption := "RAW"
+	valueRangeBody := &sheets.ValueRange{
+		Values: [][]interface{}{{fmt.Sprintf("%.2f", sleepScore), fmt.Sprintf("%.2f", etf), fmt.Sprintf("%.2f", etd), fmt.Sprintf("%.0f%%", etd*100)}},
 	}
 	_, err := es.GgSheetSrv.Spreadsheets.Values.Update(es.env.GoogleSpreadSheetId, valueRange, valueRangeBody).ValueInputOption(valueInputOption).Do()
 	if err != nil {
